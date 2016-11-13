@@ -872,7 +872,7 @@ consread(Chan *c, void *buf, long n, vlong off)
 		b = smalloc(conf.nmach*(NUMSIZE*11+1) + 1);	/* +1 for NUL */
 		bp = b;
 		for(id = 0; id < 32; id++) {
-			if(active.machs & (1<<id)) {
+			if(iscpuactive(id)) {
 				mp = MACHP(id);
 				readnum(0, bp, NUMSIZE, id, NUMSIZE);
 				bp += NUMSIZE;
@@ -1079,7 +1079,7 @@ conswrite(Chan *c, void *va, long n, vlong off)
 
 	case Qsysstat:
 		for(id = 0; id < 32; id++) {
-			if(active.machs & (1<<id)) {
+			if(iscpuactive(id)) {
 				mp = MACHP(id);
 				mp->cs = 0;
 				mp->intr = 0;
