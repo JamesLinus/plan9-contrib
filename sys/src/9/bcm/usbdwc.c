@@ -39,6 +39,7 @@ typedef struct Ctlr Ctlr;
 typedef struct Epio Epio;
 
 struct Ctlr {
+	Lock;
 	Dwcregs	*regs;		/* controller registers */
 	int	nchan;		/* number of host channels */
 	ulong	chanbusy;	/* bitmap of in-use channels */
@@ -64,6 +65,22 @@ static char Ebadlen[] = "bad usb request length";
 
 static void clog(Ep *ep, Hostchan *hc);
 static void logdump(Ep *ep);
+
+static void
+filock(Lock *l)
+{
+	int x;
+
+	x = splfhi();
+	ilock(l);
+	l->sr = x;
+}
+
+static void
+fiunlock(Lock *l)
+{
+	iunlock(l);
+}
 
 static Hostchan*
 chanalloc(Ep *ep)
@@ -157,23 +174,22 @@ sofdone(void *a)
 	Dwcregs *r;
 
 	r = a;
-	return r->gintsts & Sofintr;
+	return (r->gintmsk & Sofintr) == 0;
 }
 
 static void
 sofwait(Ctlr *ctlr, int n)
 {
 	Dwcregs *r;
-	int x;
 
 	r = ctlr->regs;
 	do{
+		filock(ctlr);
 		r->gintsts = Sofintr;
-		x = splfhi();
 		ctlr->sofchan |= 1<<n;
 		r->gintmsk |= Sofintr;
+		fiunlock(ctlr);
 		sleep(&ctlr->chanintr[n], sofdone, r);
-		splx(x);
 	}while((r->hfnum & 7) == 6);
 }
 
@@ -191,7 +207,7 @@ chandone(void *a)
 static int
 chanwait(Ep *ep, Ctlr *ctlr, Hostchan *hc, int mask)
 {
-	int intr, n, x, ointr;
+	int intr, n, ointr;
 	ulong start, now;
 	Dwcregs *r;
 
@@ -199,13 +215,14 @@ chanwait(Ep *ep, Ctlr *ctlr, Hostchan *hc, int mask)
 	n = hc - r->hchan;
 	for(;;){
 restart:
-		x = splfhi();
+		filock(ctlr);
 		r->haintmsk |= 1<<n;
 		hc->hcintmsk = mask;
-		sleep(&ctlr->chanintr[n], chandone, hc);
+		fiunlock(ctlr);
+		tsleep(&ctlr->chanintr[n], chandone, hc, 1000);
+		if((intr = hc->hcint) == 0)
+			goto restart;
 		hc->hcintmsk = 0;
-		splx(x);
-		intr = hc->hcint;
 		if(intr & Chhltd)
 			return intr;
 		start = fastticks(0);
@@ -217,13 +234,14 @@ restart:
 				if((ointr != Ack && ointr != (Ack|Xfercomp)) ||
 				   intr != (Ack|Chhltd|Xfercomp) ||
 				   (now - start) > 60)
-					dprint("await %x after %ld %x -> %x\n",
+					dprint("await %x after %ldµs %x -> %x\n",
 						mask, now - start, ointr, intr);
 				return intr;
 			}
 			if((intr & mask) == 0){
-				dprint("ep%d.%d await %x intr %x -> %x\n",
-					ep->dev->nb, ep->nb, mask, ointr, intr);
+				if(intr != Nak)
+					dprint("ep%d.%d await %x after %ldµs intr %x -> %x\n",
+						ep->dev->nb, ep->nb, mask, now - start, ointr, intr);
 				goto restart;
 			}
 			now = fastticks(0);
@@ -253,6 +271,8 @@ chanintr(Ctlr *ctlr, int n)
 	int i;
 
 	hc = &ctlr->regs->hchan[n];
+	if((hc->hcint & hc->hcintmsk) == 0)
+		return 1;
 	if(ctlr->debugchan & (1<<n))
 		clog(nil, hc);
 	if((hc->hcsplt & Spltena) == 0)
@@ -346,7 +366,7 @@ chanio(Ep *ep, Hostchan *hc, int dir, int pid, void *a, int len)
 	else
 		n = len;
 	hc->hctsiz = n | npkt<<OPktcnt | pid;
-	hc->hcdma  = PADDR(a);
+	hc->hcdma  = dmaaddr(a);
 
 	nleft = len;
 	logstart(ep);
@@ -377,13 +397,19 @@ chanio(Ep *ep, Hostchan *hc, int dir, int pid, void *a, int len)
 		}
 		hc->hcchar = (hc->hcchar &~ Chdis) | Chen;
 		clog(ep, hc);
+wait:
 		if(ep->ttype == Tbulk && dir == Epin)
-			i = chanwait(ep, ctlr, hc, /* Ack| */ Chhltd);
+			i = chanwait(ep, ctlr, hc, Chhltd);
 		else if(ep->ttype == Tintr && (hc->hcsplt & Spltena))
 			i = chanwait(ep, ctlr, hc, Chhltd);
 		else
 			i = chanwait(ep, ctlr, hc, Chhltd|Nak);
 		clog(ep, hc);
+		if(hc->hcint != i){
+			dprint("chanwait intr %ux->%ux\n", i, hc->hcint);
+			if((i = hc->hcint) == 0)
+				goto wait;
+		}
 		hc->hcint = i;
 
 		if(hc->hcsplt & Spltena){
@@ -409,7 +435,7 @@ chanio(Ep *ep, Hostchan *hc, int dir, int pid, void *a, int len)
 			if(i & ~(Chhltd|Ack))
 				error(Eio);
 			if(hc->hcdma != hcdma)
-				print("usbotg: weird hcdma %x->%x intr %x->%x\n",
+				print("usbotg: weird hcdma %ux->%ux intr %ux->%ux\n",
 					hcdma, hc->hcdma, i, hc->hcint);
 		}
 		n = hc->hcdma - hcdma;
@@ -419,7 +445,7 @@ chanio(Ep *ep, Hostchan *hc, int dir, int pid, void *a, int len)
 			else
 				continue;
 		}
-		if(dir == Epin && ep->ttype == Tbulk && n == nleft){
+		if(dir == Epin && ep->ttype == Tbulk){
 			nt = (hctsiz & Xfersize) - (hc->hctsiz & Xfersize);
 			if(nt != n){
 				if(n == ROUND(nt, 4))
@@ -523,8 +549,8 @@ ctltrans(Ep *ep, uchar *req, long n)
 		if(datalen <= 0 || datalen > Maxctllen)
 			error(Ebadlen);
 		/* XXX cache madness */
-		epio->cb = b = allocb(ROUND(datalen, ep->maxpkt) + CACHELINESZ);
-		b->wp = (uchar*)ROUND((uintptr)b->wp, CACHELINESZ);
+		epio->cb = b = allocb(ROUND(datalen, ep->maxpkt));
+		assert(((uintptr)b->wp & (BLOCKALIGN-1)) == 0);
 		memset(b->wp, 0x55, b->lim - b->wp);
 		cachedwbinvse(b->wp, b->lim - b->wp);
 		data = b->wp;
@@ -549,6 +575,7 @@ ctltrans(Ep *ep, uchar *req, long n)
 		}else
 			b->wp += chanio(ep, hc, Epin, DATA1, data, datalen);
 		chanio(ep, hc, Epout, DATA1, nil, 0);
+		cachedinvse(b->rp, BLEN(b));
 		n = Rsetuplen;
 	}else{
 		if(datalen > 0)
@@ -653,6 +680,7 @@ fiqintr(Ureg*, void *a)
 	ctlr = hp->aux;
 	r = ctlr->regs;
 	wakechan = 0;
+	filock(ctlr);
 	intr = r->gintsts;
 	if(intr & Hcintr){
 		haint = r->haint & r->haintmsk;
@@ -678,6 +706,7 @@ fiqintr(Ureg*, void *a)
 		ctlr->wakechan |= wakechan;
 		armtimerset(1);
 	}
+	fiunlock(ctlr);
 }
 
 static void
@@ -685,14 +714,14 @@ irqintr(Ureg*, void *a)
 {
 	Ctlr *ctlr;
 	uint wakechan;
-	int i, x;
+	int i;
 
 	ctlr = a;
-	x = splfhi();
+	filock(ctlr);
 	armtimerset(0);
 	wakechan = ctlr->wakechan;
 	ctlr->wakechan = 0;
-	splx(x);
+	fiunlock(ctlr);
 	for(i = 0; wakechan; i++){
 		if(wakechan & 1)
 			wakeup(&ctlr->chanintr[i]);
@@ -772,10 +801,12 @@ epread(Ep *ep, void *a, long n)
 		/* fall through */
 	case Tbulk:
 		/* XXX cache madness */
-		b = allocb(ROUND(n, ep->maxpkt) + CACHELINESZ);
-		p = (uchar*)ROUND((uintptr)b->base, CACHELINESZ);
-		cachedwbinvse(p, n);
+		b = allocb(ROUND(n, ep->maxpkt));
+		p = b->rp;
+		assert(((uintptr)p & (BLOCKALIGN-1)) == 0);
+		cachedinvse(p, n);
 		nr = eptrans(ep, Read, p, n);
+		cachedinvse(p, nr);
 		epio->lastpoll = TK2MS(m->ticks);
 		memmove(a, p, nr);
 		qunlock(epio);
@@ -814,8 +845,9 @@ epwrite(Ep *ep, void *a, long n)
 	case Tctl:
 	case Tbulk:
 		/* XXX cache madness */
-		b = allocb(n + CACHELINESZ);
-		p = (uchar*)ROUND((uintptr)b->base, CACHELINESZ);
+		b = allocb(n);
+		p = b->wp;
+		assert(((uintptr)p & (BLOCKALIGN-1)) == 0);
 		memmove(p, a, n);
 		cachedwbse(p, n);
 		if(ep->ttype == Tctl)
